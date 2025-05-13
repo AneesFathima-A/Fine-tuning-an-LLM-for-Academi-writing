@@ -1,0 +1,73 @@
+# TESTING FINE TUNED MODEL FOR GENERATING SHORT SUMMARIES (GRADIO INTERFACE)
+
+!pip install transformers peft accelerate gradio --quiet
+
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel, PeftConfig
+import gradio as gr
+import os
+
+# Define paths
+checkpoint_path = "/content/drive/MyDrive/tinyllama-summary/checkpoint-100"
+base_model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+# Mount Google Drive (run this in Colab first)
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Verify files (for debugging)
+print("Files in checkpoint-100:", os.listdir(checkpoint_path))
+
+# Load tokenizer
+tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+tokenizer.pad_token = tokenizer.eos_token
+
+# Load base model
+base_model = AutoModelForCausalLM.from_pretrained(
+    base_model_name,
+    device_map="auto",
+    torch_dtype=torch.float16
+)
+
+# Load PEFT config and model with local files
+config = PeftConfig.from_pretrained(checkpoint_path, local_files_only=True)
+model = PeftModel.from_pretrained(
+    base_model,
+    checkpoint_path,
+    config=config,
+    local_files_only=True
+)
+
+model.eval()
+
+# Summary generation function
+def generate_short_summary(title):
+    prompt = f"### Title:\n{title}\n\n### Summary:\n"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    model.to(device)
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=250,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50,
+        do_sample=True,
+        repetition_penalty=1.1,
+        pad_token_id=tokenizer.eos_token_id
+    )
+
+    summary = tokenizer.decode(outputs[0], skip_special_tokens=True).split("### Summary:")[-1].strip()
+    return summary
+
+# Gradio Interface
+demo = gr.Interface(
+    fn=generate_short_summary,
+    inputs=gr.Textbox(label="Enter Paper Title"),
+    outputs=gr.Textbox(label="Generated Short Summary"),
+    title="📚 Test Fine-Tuned TinyLlama Summary Generator"
+)
+
+demo.launch()
