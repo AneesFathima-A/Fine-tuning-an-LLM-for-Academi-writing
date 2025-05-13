@@ -1,0 +1,81 @@
+# TESTING ENHANCED FINE TUNED MODEL WITH GEMINI API FOR GENERATING STRUCTURED SUMMARIES (GRADIO INTERFACE)
+
+!pip install transformers peft accelerate gradio google-generativeai --quiet
+
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel, PeftConfig
+import gradio as gr
+import os
+import google.generativeai as genai
+
+# === SETUP ===
+
+# Paths and model
+checkpoint_path = "/content/drive/MyDrive/tinyllama-summary/checkpoint-100" # Adjust as needed
+base_model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+gemini_api_key = "YOUR GEMINI API KEY" # <- Replace with your API key
+
+# Mount Drive
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Load tokenizer and base model
+tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+tokenizer.pad_token = tokenizer.eos_token
+base_model = AutoModelForCausalLM.from_pretrained(base_model_name, device_map="auto", torch_dtype=torch.float16)
+
+# Load fine-tuned model
+config = PeftConfig.from_pretrained(checkpoint_path, local_files_only=True)
+model = PeftModel.from_pretrained(base_model, checkpoint_path, config=config, local_files_only=True)
+model.eval()
+
+# === Gemini Setup ===
+genai.configure(api_key=gemini_api_key)
+gemini = genai.GenerativeModel("gemini-1.5-pro-latest")
+
+# === FUNCTION ===
+
+def generate_structured_summary(title):
+    # Step 1: Generate short summary with TinyLLaMA
+    llama_prompt = f"### Title:\n{title}\n\n### Summary:\n"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    inputs = tokenizer(llama_prompt, return_tensors="pt").to(device)
+    model.to(device)
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=250,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50,
+        do_sample=True,
+        repetition_penalty=1.1,
+        pad_token_id=tokenizer.eos_token_id
+    )
+
+    short_summary = tokenizer.decode(outputs[0], skip_special_tokens=True).split("### Summary:")[-1].strip()
+
+    # Step 2: Enhance with Gemini
+    gemini_prompt = (
+        "Enhance the following summary into a detailed academic-style writeup with the following structure:\n"
+        "Title, Introduction, Objective, Summary, and Conclusion.\n"
+        "Make it up to 400 words, structured and informative.\n\n"
+        f"Original Summary:\n{short_summary}"
+    )
+
+    response = gemini.generate_content(gemini_prompt)
+    enhanced_summary = response.text
+
+    return enhanced_summary
+
+# === Gradio UI ===
+
+demo = gr.Interface(
+    fn=generate_structured_summary,
+    inputs=gr.Textbox(label="Enter Paper Title"),
+    outputs=gr.Textbox(label="Enhanced Structured Summary (via Gemini)"),
+    title="📚 Research Summary Enhancer: TinyLLaMA + Gemini"
+)
+
+demo.launch()
