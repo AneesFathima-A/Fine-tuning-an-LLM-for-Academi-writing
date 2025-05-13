@@ -1,0 +1,240 @@
+# TRAIN DATA WITH TINYLLAMA MODEL
+
+!pip install transformers accelerate peft bitsandbytes datasets gradio google-generativeai --quiet
+
+import os
+import torch
+import pandas as pd
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig,
+    TrainingArguments, Trainer, DataCollatorForLanguageModeling
+)
+from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
+import gradio as gr
+import google.generativeai as genai
+
+# Load and format dataset
+df = pd.read_csv('summaries_train.csv')
+df.dropna()
+df.head()
+
+def format_prompt(row):
+    return {"text": f"### Title:\n{row['title']}\n\n### Summary:\n{row['summary']}"}
+
+formatted_data = df.apply(format_prompt, axis=1, result_type="expand")
+dataset = Dataset.from_pandas(formatted_data)
+
+# Load model and tokenizer
+model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer.pad_token = tokenizer.eos_token
+
+quant_config = BitsAndBytesConfig(load_in_8bit=True, llm_int8_threshold=6.0)
+base_model = AutoModelForCausalLM.from_pretrained(
+    model_name, device_map="auto", quantization_config=quant_config
+)
+base_model = prepare_model_for_kbit_training(base_model)
+
+lora_config = LoraConfig(
+    r=8, lora_alpha=16,
+    target_modules=["q_proj", "v_proj"],
+    lora_dropout=0.05,
+    bias="none", task_type="CAUSAL_LM"
+)
+
+model = get_peft_model(base_model, lora_config)
+
+# Tokenize
+def tokenize(batch):
+    return tokenizer(batch["text"], padding="max_length", truncation=True, max_length=256)
+
+tokenized_dataset = dataset.map(tokenize, batched=True)
+
+# Set up training
+output_dir = "/content/drive/MyDrive/tinyllama-summary"
+training_args = TrainingArguments(
+    output_dir=output_dir,
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=4,
+    num_train_epochs=1,  
+    learning_rate=2e-4,
+    fp16=True,
+    logging_steps=50,
+    save_steps=100,
+    save_total_limit=1,
+    report_to="none",
+    resume_from_checkpoint=False 
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_dataset,
+    tokenizer=tokenizer,
+    data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False)
+)
+
+trainer.train()
+
+# Save final model
+model.save_pretrained(output_dir)
+tokenizer.save_pretrained(output_dir)
+
+
+# TESTING FINE TUNED MODEL FOR GENERATING SHORT SUMMARIES (GRADIO INTERFACE)
+
+!pip install transformers peft accelerate gradio --quiet
+
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel, PeftConfig
+import gradio as gr
+import os
+
+# Define paths
+checkpoint_path = "/content/drive/MyDrive/tinyllama-summary/checkpoint-100"
+base_model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+# Mount Google Drive (run this in Colab first)
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Verify files (for debugging)
+print("Files in checkpoint-100:", os.listdir(checkpoint_path))
+
+# Load tokenizer
+tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+tokenizer.pad_token = tokenizer.eos_token
+
+# Load base model
+base_model = AutoModelForCausalLM.from_pretrained(
+    base_model_name,
+    device_map="auto",
+    torch_dtype=torch.float16
+)
+
+# Load PEFT config and model with local files
+config = PeftConfig.from_pretrained(checkpoint_path, local_files_only=True)
+model = PeftModel.from_pretrained(
+    base_model,
+    checkpoint_path,
+    config=config,
+    local_files_only=True
+)
+
+model.eval()
+
+# Summary generation function
+def generate_short_summary(title):
+    prompt = f"### Title:\n{title}\n\n### Summary:\n"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    model.to(device)
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=250,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50,
+        do_sample=True,
+        repetition_penalty=1.1,
+        pad_token_id=tokenizer.eos_token_id
+    )
+
+    summary = tokenizer.decode(outputs[0], skip_special_tokens=True).split("### Summary:")[-1].strip()
+    return summary
+
+# Gradio Interface
+demo = gr.Interface(
+    fn=generate_short_summary,
+    inputs=gr.Textbox(label="Enter Paper Title"),
+    outputs=gr.Textbox(label="Generated Short Summary"),
+    title="📚 Test Fine-Tuned TinyLlama Summary Generator"
+)
+
+demo.launch()
+
+
+# TESTING ENHANCED FINE TUNED MODEL WITH GEMINI API FOR GENERATING STRUCTURED SUMMARIES (GRADIO INTERFACE)
+
+!pip install transformers peft accelerate gradio google-generativeai --quiet
+
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel, PeftConfig
+import gradio as gr
+import os
+import google.generativeai as genai
+
+# === SETUP ===
+
+# Paths and model
+checkpoint_path = "/content/drive/MyDrive/tinyllama-summary/checkpoint-100" # Adjust as needed
+base_model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+gemini_api_key = "YOUR GEMINI API KEY" # <- Replace with your API key
+
+# Mount Drive
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Load tokenizer and base model
+tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+tokenizer.pad_token = tokenizer.eos_token
+base_model = AutoModelForCausalLM.from_pretrained(base_model_name, device_map="auto", torch_dtype=torch.float16)
+
+# Load fine-tuned model
+config = PeftConfig.from_pretrained(checkpoint_path, local_files_only=True)
+model = PeftModel.from_pretrained(base_model, checkpoint_path, config=config, local_files_only=True)
+model.eval()
+
+# === Gemini Setup ===
+genai.configure(api_key=gemini_api_key)
+gemini = genai.GenerativeModel("gemini-1.5-pro-latest")
+
+# === FUNCTION ===
+
+def generate_structured_summary(title):
+    # Step 1: Generate short summary with TinyLLaMA
+    llama_prompt = f"### Title:\n{title}\n\n### Summary:\n"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    inputs = tokenizer(llama_prompt, return_tensors="pt").to(device)
+    model.to(device)
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=250,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50,
+        do_sample=True,
+        repetition_penalty=1.1,
+        pad_token_id=tokenizer.eos_token_id
+    )
+
+    short_summary = tokenizer.decode(outputs[0], skip_special_tokens=True).split("### Summary:")[-1].strip()
+
+    # Step 2: Enhance with Gemini
+    gemini_prompt = (
+        "Enhance the following summary into a detailed academic-style writeup with the following structure:\n"
+        "Title, Introduction, Objective, Summary, and Conclusion.\n"
+        "Make it up to 400 words, structured and informative.\n\n"
+        f"Original Summary:\n{short_summary}"
+    )
+
+    response = gemini.generate_content(gemini_prompt)
+    enhanced_summary = response.text
+
+    return enhanced_summary
+
+# === Gradio UI ===
+
+demo = gr.Interface(
+    fn=generate_structured_summary,
+    inputs=gr.Textbox(label="Enter Paper Title"),
+    outputs=gr.Textbox(label="Enhanced Structured Summary (via Gemini)"),
+    title="📚 Research Summary Enhancer: TinyLLaMA + Gemini"
+)
+
+demo.launch()
